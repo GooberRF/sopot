@@ -24,27 +24,27 @@ set(SRCS
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SRCS})
 
-add_library(rf2patch SHARED ${SRCS})
-target_compile_features(rf2patch PUBLIC cxx_std_20)
-set_target_properties(rf2patch PROPERTIES
+add_library(Sopot SHARED ${SRCS})
+target_compile_features(Sopot PUBLIC cxx_std_20)
+set_target_properties(Sopot PROPERTIES
     PREFIX ""
     OUTPUT_NAME "Sopot"
     CXX_EXTENSIONS NO
 )
-enable_warnings(rf2patch)
-setup_debug_info(rf2patch)
+enable_warnings(Sopot)
+setup_debug_info(Sopot)
 
-target_compile_definitions(rf2patch PRIVATE
+target_compile_definitions(Sopot PRIVATE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
     BUILD_DLL
 )
 
-target_include_directories(rf2patch PRIVATE
+target_include_directories(Sopot PRIVATE
     ${CMAKE_SOURCE_DIR}/vendor/d3d8
 )
 
-target_link_libraries(rf2patch
+target_link_libraries(Sopot
     PatchCommon
     Xlog
     Common

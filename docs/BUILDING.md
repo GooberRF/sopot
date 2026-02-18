@@ -13,7 +13,7 @@ cmake -S . -B build -A Win32
 Build launcher and patch DLL:
 
 ```powershell
-cmake --build build --config Release --target SopotLauncher rf2patch
+cmake --build build --config Release --target SopotLauncher Sopot
 ```
 
 Artifacts:

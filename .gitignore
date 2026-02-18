@@ -1,0 +1,21 @@
+/dist
+/build*
+/research
+/out
+
+# Visual Studio
+*.sln
+*.VC.*
+ipch
+.vs
+*.vcxproj*
+*.vcproj
+*.sdf
+*.pdb
+*.idb
+*.lib
+*.aps
+
+# Visual Studio Code
+.vscode
+CMakeSettings.json

@@ -1,0 +1,7 @@
+#include <windows.h>
+
+#define VER_FILETYPE VFT_DLL
+#define VER_FILE_DESCRIPTION "RF2 Community Patch (SOPOT) runtime"
+#define VER_ORIGINAL_FILENAME "Sopot.dll"
+
+#include <common/version/version.rc>

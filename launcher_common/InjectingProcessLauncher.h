@@ -1,0 +1,52 @@
+#pragma once
+
+#include <windows.h>
+#include <xlog/xlog.h>
+#include "Process.h"
+#include "Thread.h"
+#include "DllInjector.h"
+
+class ProcessTerminatedError : public std::runtime_error
+{
+public:
+    ProcessTerminatedError() : std::runtime_error("process has terminated") {}
+};
+
+class InjectingProcessLauncher
+{
+private:
+    Process m_process;
+    Thread m_thread;
+    bool m_resumed = false;
+
+public:
+    InjectingProcessLauncher(const char* app_name, const char* work_dir, const char* command_line,
+                             STARTUPINFO& startup_info, int timeout);
+
+    ~InjectingProcessLauncher()
+    {
+        try {
+            if (!m_resumed && m_process)
+                m_process.terminate(1);
+        }
+        catch (const std::exception& e) {
+            xlog::error("{}", e.what());
+        }
+    }
+
+    void inject_dll(const char* dll_filename, const char* init_fun_name, int timeout)
+    {
+        DllInjector injector{m_process};
+        injector.inject_dll(dll_filename, init_fun_name, timeout);
+    }
+
+    void resume_main_thread();
+
+    void wait(int timeout)
+    {
+        m_process.wait(timeout);
+    }
+
+private:
+    void wait_for_process_initialization(uintptr_t entry_point, int timeout);
+};

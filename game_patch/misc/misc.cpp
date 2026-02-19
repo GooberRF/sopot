@@ -7,6 +7,7 @@
 #include "../rf2/os/input.h"
 #include "../rf2/os/window.h"
 #include "../rf2/player/autoaim.h"
+#include "../rf2/player/camera.h"
 #include "../rf2/player/reticle.h"
 #include "../rf2/rf2.h"
 #include <patch_common/FunHook.h>
@@ -21,9 +22,11 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -47,6 +50,7 @@ bool g_fast_start_enabled = true;
 bool g_direct_input_mouse_enabled = true;
 bool g_aim_slowdown_on_target_enabled = true;
 bool g_crosshair_enemy_indicator_enabled = true;
+float g_mouse_aim_sensitivity_scale = 1.0f;
 UINT g_forced_window_width = default_window_width;
 UINT g_forced_window_height = default_window_height;
 int g_forced_window_x = default_window_x;
@@ -238,6 +242,7 @@ int __cdecl set_video_mode_hook(
 void __cdecl init_mouse_surface_hook(int width, int height);
 int __cdecl play_movie_hook(const char* movie_name, int mode);
 void __cdecl mouse_update_hook();
+void __cdecl mouse_get_delta_hook(int* x, int* y, int* z);
 
 FunHook<int __cdecl(int, int, int, int, int, HWND, int, int, int, int)> g_set_video_mode_hook{
     rf2::gr::set_video_mode_addr,
@@ -291,6 +296,25 @@ FunHook<void __cdecl()> g_mouse_update_hook{
     rf2::os::input::mouse_update_addr,
     mouse_update_hook,
 };
+FunHook<void __cdecl(int*, int*, int*)> g_mouse_get_delta_hook{
+    rf2::os::input::mouse_get_delta_addr,
+    mouse_get_delta_hook,
+};
+
+int scale_mouse_delta_value(int value, float scale)
+{
+    if (!std::isfinite(scale)) {
+        return value;
+    }
+    const double scaled = static_cast<double>(value) * static_cast<double>(scale);
+    if (scaled >= static_cast<double>(std::numeric_limits<int>::max())) {
+        return std::numeric_limits<int>::max();
+    }
+    if (scaled <= static_cast<double>(std::numeric_limits<int>::min())) {
+        return std::numeric_limits<int>::min();
+    }
+    return static_cast<int>(std::lround(scaled));
+}
 
 bool is_current_process_window(HWND window)
 {
@@ -608,6 +632,7 @@ HRESULT __stdcall d3d8_present_hook(
             }
         }
         frame_limiter_draw_overlay(overlay_window);
+        console_on_present(overlay_window);
     }
     return hr;
 }
@@ -622,13 +647,11 @@ void hook_d3d8_device(IDirect3DDevice8* device)
         d3d8_device_reset_vtbl_index,
         reinterpret_cast<void*>(d3d8_reset_hook),
         reinterpret_cast<void**>(&g_original_reset));
-    if (frame_limiter_is_active()) {
-        patch_vtable_entry(
-            device,
-            d3d8_device_present_vtbl_index,
-            reinterpret_cast<void*>(d3d8_present_hook),
-            reinterpret_cast<void**>(&g_original_present));
-    }
+    patch_vtable_entry(
+        device,
+        d3d8_device_present_vtbl_index,
+        reinterpret_cast<void*>(d3d8_present_hook),
+        reinterpret_cast<void**>(&g_original_present));
 }
 
 HRESULT __stdcall d3d8_create_device_hook(
@@ -1088,6 +1111,34 @@ void __cdecl mouse_update_hook()
     apply_direct_input_mouse_mode(false);
     apply_aim_slowdown_setting(false);
     g_mouse_update_hook.call_target();
+    if (console_is_open()) {
+        // Allow mouse updates, but clear keyboard state while SOPOT console is active.
+        rf2::os::input::reset_key_state();
+        rf2::os::input::alt_key_down = 0;
+        rf2::os::input::tab_key_down = 0;
+    }
+}
+
+void __cdecl mouse_get_delta_hook(int* x, int* y, int* z)
+{
+    g_mouse_get_delta_hook.call_target(x, y, z);
+    if (rf2::os::input::mouse_direct_input_enabled == 0) {
+        return;
+    }
+    if (!rf2::player::camera::local_player_ptr()) {
+        // Keep menu cursor behavior unchanged; only scale in gameplay.
+        return;
+    }
+    const float scale = g_mouse_aim_sensitivity_scale;
+    if (!std::isfinite(scale) || scale < 0.0f || std::fabs(scale - 1.0f) < 0.000001f) {
+        return;
+    }
+    if (x) {
+        *x = scale_mouse_delta_value(*x, scale);
+    }
+    if (y) {
+        *y = scale_mouse_delta_value(*y, scale);
+    }
 }
 
 bool is_game_window_foreground()
@@ -1220,7 +1271,8 @@ VOID __stdcall sleep_hook(DWORD milliseconds)
     if (milliseconds > 0 && milliseconds <= 20) {
         // Keep RF2's active frametime pacing intact. Only bypass short sleeps when
         // the game is inactive to avoid background throttling/freezes on alt-tab.
-        const bool is_active = g_is_window_active_hook.call_target() != 0;
+        const bool is_active =
+            (g_is_window_active_hook.call_target() != 0) || console_is_open() || is_game_window_foreground();
         if (!is_active) {
             patched_milliseconds = 0;
             const int log_idx = g_sleep_clamp_log_count.fetch_add(1, std::memory_order_relaxed);
@@ -1529,6 +1581,7 @@ void install_window_mode_patch()
     g_get_viewport_height_hook.install();
     g_init_mouse_surface_hook.install();
     g_mouse_update_hook.install();
+    g_mouse_get_delta_hook.install();
 
     if (!g_force_window_mode) {
         install_background_activity_patch();
@@ -1625,6 +1678,24 @@ void misc_apply_patches(const Rf2PatchSettings& settings)
     apply_direct_input_mouse_mode(true);
     apply_aim_slowdown_setting(true);
     apply_crosshair_enemy_indicator_setting(true);
+}
+
+bool misc_set_mouse_aim_sensitivity(float value)
+{
+    if (!std::isfinite(value) || value < 0.0f) {
+        return false;
+    }
+    g_mouse_aim_sensitivity_scale = value;
+    return true;
+}
+
+bool misc_get_mouse_aim_sensitivity(float& out_value)
+{
+    if (!std::isfinite(g_mouse_aim_sensitivity_scale) || g_mouse_aim_sensitivity_scale < 0.0f) {
+        return false;
+    }
+    out_value = g_mouse_aim_sensitivity_scale;
+    return true;
 }
 
 bool misc_try_handle_console_command(

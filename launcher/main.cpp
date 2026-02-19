@@ -94,6 +94,7 @@ struct PatchSettings
     bool direct_input_mouse = true;
     bool aim_slowdown_on_target = true;
     bool crosshair_enemy_indicator = true;
+    bool experimental_fps_stabilization = false;
     bool auto_close_launcher = true;
 };
 
@@ -454,6 +455,16 @@ PatchSettings load_patch_settings(const std::string& settings_path)
         settings_path.c_str());
     settings.auto_close_launcher = parse_bool_text(auto_close_buf);
 
+    char experimental_fps_stabilization_buf[64] = {};
+    GetPrivateProfileStringA(
+        "sopot",
+        "experimental_fps_stabilization",
+        "0",
+        experimental_fps_stabilization_buf,
+        static_cast<DWORD>(sizeof(experimental_fps_stabilization_buf)),
+        settings_path.c_str());
+    settings.experimental_fps_stabilization = parse_bool_text(experimental_fps_stabilization_buf);
+
     char resolution_buf[64] = {};
     GetPrivateProfileStringA(
         "sopot",
@@ -533,6 +544,11 @@ bool save_patch_settings(const std::string& settings_path, const PatchSettings& 
         "auto_close_launcher",
         settings.auto_close_launcher ? "1" : "0",
         settings_path.c_str());
+    const BOOL wrote_experimental_fps_stabilization = WritePrivateProfileStringA(
+        "sopot",
+        "experimental_fps_stabilization",
+        settings.experimental_fps_stabilization ? "1" : "0",
+        settings_path.c_str());
     char fov_value[64] = {};
     std::snprintf(fov_value, sizeof(fov_value), "%.3f", settings.fov);
     const BOOL wrote_fov = WritePrivateProfileStringA(
@@ -550,6 +566,7 @@ bool save_patch_settings(const std::string& settings_path, const PatchSettings& 
         && wrote_aim_slowdown != FALSE
         && wrote_crosshair_enemy != FALSE
         && wrote_auto_close != FALSE
+        && wrote_experimental_fps_stabilization != FALSE
         && wrote_fov != FALSE;
 }
 

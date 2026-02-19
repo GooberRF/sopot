@@ -3,6 +3,7 @@
 #include "../misc/misc.h"
 #include "../player/camera.h"
 #include "../rf2/os/console.h"
+#include "../rf2/os/input.h"
 #include "../rf2/rf2.h"
 #include <patch_common/FunHook.h>
 #include <patch_common/MemUtils.h>
@@ -11,26 +12,26 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace
 {
-constexpr const char* rf2patch_console_class_name = "SopotConsoleWindow";
-constexpr int id_console_label = 3100;
-constexpr int id_console_edit = 3101;
-constexpr int id_console_status = 3104;
-constexpr int id_console_output = 3105;
-constexpr UINT console_anim_timer_id = 0x52F2;
-constexpr UINT console_anim_timer_interval_ms = 20;
 constexpr int console_open_height_px = 320;
-constexpr int console_anim_step_px = 96;
+constexpr int console_anim_step_px = 48;
 constexpr COLORREF console_text_color = RGB(96, 255, 128);
 constexpr COLORREF console_status_color = RGB(176, 224, 176);
+constexpr COLORREF console_hint_color = RGB(128, 176, 128);
+constexpr COLORREF console_border_color = RGB(64, 128, 64);
+constexpr const char* console_help_text =
+    "Input: Enter execute, Tab complete, . <text> search, fov/maxfps/r_showfps/ms/directinput/aimslow/enemycrosshair, ~ toggle";
+constexpr size_t max_console_input_chars = 512;
 
 template<size_t N>
 uintptr_t find_pattern(const uint8_t* base, size_t size, const std::array<int, N>& pattern)
@@ -67,20 +68,16 @@ struct ConsoleCommandInfo
 void append_rf2patch_builtin_commands(std::vector<ConsoleCommandInfo>& commands)
 {
     commands.push_back({"fov", "fov <num> (0 = auto-scale from 90 at 4:3)"});
-    commands.push_back({"maxfps", "maxfps <num> (0 = uncapped; render cap applied in Present)"});
-    commands.push_back({"r_showfps", "r_showfps <0|1> (draw simulation/render FPS in top-right overlay)"});
+    commands.push_back({"maxfps", "maxfps <num> (experimental; 0 = uncapped; render cap applied in Present)"});
+    commands.push_back({"r_showfps", "r_showfps <0|1> (experimental; draw simulation/render FPS in top-right overlay)"});
+    commands.push_back({"ms", "ms <num> (set gameplay mouse aim sensitivity; no arg prints current value)"});
     commands.push_back({"directinput", "directinput <0|1> (toggle DirectInput mouse for menus/gameplay)"});
     commands.push_back({"aimslow", "aimslow <0|1> (toggle target-on-enemy aim slowdown)"});
     commands.push_back({"enemycrosshair", "enemycrosshair <0|1> (toggle enemy crosshair variant image)"});
 }
 
-HWND g_console_window = nullptr;
-HWND g_console_edit = nullptr;
-HWND g_console_output = nullptr;
-HWND g_console_status = nullptr;
 HWND g_console_hooked_game_window = nullptr;
 WndProcFn g_original_game_window_proc = nullptr;
-WndProcFn g_original_console_edit_proc = nullptr;
 int g_console_command_log_count = 0;
 int g_console_print_log_count = 0;
 std::vector<std::string> g_console_output_lines{};
@@ -90,15 +87,18 @@ bool g_console_refresh_pending = false;
 bool g_console_is_open = false;
 int g_console_current_height = 0;
 int g_console_target_height = 0;
+int g_console_scroll_lines_from_bottom = 0;
+int g_console_visible_line_count = 12;
+std::string g_console_input_text{};
+std::string g_console_status_text{"Ready."};
 HBRUSH g_console_bg_brush = nullptr;
+HBRUSH g_console_border_brush = nullptr;
 HFONT g_console_font = nullptr;
 std::string g_tab_completion_seed{};
 std::vector<std::string> g_tab_completion_matches{};
 size_t g_tab_completion_index = 0;
 HWND g_known_game_window = nullptr;
 
-LRESULT CALLBACK console_window_proc(HWND hwnd, UINT msg, WPARAM w_param, LPARAM l_param);
-LRESULT CALLBACK console_edit_proc(HWND hwnd, UINT msg, WPARAM w_param, LPARAM l_param);
 LRESULT CALLBACK game_window_proc_hook(HWND hwnd, UINT msg, WPARAM w_param, LPARAM l_param);
 void install_game_window_proc_hook(HWND window);
 void __cdecl console_print_hook(const char* text, int channel);
@@ -234,28 +234,229 @@ bool contains_case_insensitive(std::string_view haystack, std::string_view needl
     return haystack_lc.find(needle_lc) != std::string::npos;
 }
 
-std::string get_window_text(HWND control)
+int get_control_profile_count()
 {
-    if (!control || !IsWindow(control)) {
-        return {};
+    const int count = rf2::os::input::control_profile_count;
+    if (count <= 0) {
+        return 0;
+    }
+    return std::min(count, rf2::os::input::max_control_profiles);
+}
+
+bool is_valid_control_profile_index(int profile_index, int profile_count)
+{
+    return profile_index >= 0 && profile_index < profile_count;
+}
+
+uintptr_t get_control_profile_addr(int profile_index)
+{
+    return rf2::os::input::control_profiles_addr
+        + static_cast<uintptr_t>(profile_index) * rf2::os::input::control_profile_size;
+}
+
+bool try_get_control_profile_look_sensitivity(int profile_index, float& out_x, float& out_y)
+{
+    const int profile_count = get_control_profile_count();
+    if (!is_valid_control_profile_index(profile_index, profile_count)) {
+        return false;
     }
 
-    const int text_len = GetWindowTextLengthA(control);
-    if (text_len <= 0) {
-        return {};
+    const uintptr_t profile_addr = get_control_profile_addr(profile_index);
+    const float look_x =
+        addr_as_ref<float>(profile_addr + rf2::os::input::control_profile_look_horizontal_sensitivity_offset);
+    const float look_y =
+        addr_as_ref<float>(profile_addr + rf2::os::input::control_profile_look_vertical_sensitivity_offset);
+    if (!std::isfinite(look_x) || !std::isfinite(look_y)) {
+        return false;
     }
 
-    std::string buffer(static_cast<size_t>(text_len) + 1, '\0');
-    GetWindowTextA(control, buffer.data(), text_len + 1);
-    buffer.resize(static_cast<size_t>(text_len));
-    return buffer;
+    out_x = look_x;
+    out_y = look_y;
+    return true;
+}
+
+int get_preferred_control_profile_index()
+{
+    const int profile_count = get_control_profile_count();
+    if (profile_count <= 0) {
+        return -1;
+    }
+
+    const int active_profile = rf2::os::input::active_control_profile;
+    if (is_valid_control_profile_index(active_profile, profile_count)) {
+        return active_profile;
+    }
+
+    const int active_mouse_profile = rf2::os::input::active_mouse_control_profile;
+    if (is_valid_control_profile_index(active_mouse_profile, profile_count)) {
+        return active_mouse_profile;
+    }
+
+    return 0;
+}
+
+bool is_nonzero_sensitivity(float x, float y)
+{
+    constexpr float epsilon = 0.0000001f;
+    return std::fabs(x) > epsilon || std::fabs(y) > epsilon;
+}
+
+bool try_get_mouse_aim_sensitivity(float& out_x, float& out_y)
+{
+    float patch_scale = 0.0f;
+    if (misc_get_mouse_aim_sensitivity(patch_scale)) {
+        out_x = patch_scale;
+        out_y = patch_scale;
+        return true;
+    }
+
+    bool have_candidate = false;
+    float candidate_x = 0.0f;
+    float candidate_y = 0.0f;
+
+    const int preferred_profile = get_preferred_control_profile_index();
+    if (preferred_profile >= 0) {
+        float look_x = 0.0f;
+        float look_y = 0.0f;
+        if (try_get_control_profile_look_sensitivity(preferred_profile, look_x, look_y)) {
+            candidate_x = look_x;
+            candidate_y = look_y;
+            have_candidate = true;
+            if (is_nonzero_sensitivity(look_x, look_y)) {
+                out_x = look_x;
+                out_y = look_y;
+                return true;
+            }
+        }
+    }
+
+    const int profile_count = get_control_profile_count();
+    for (int i = 0; i < profile_count; ++i) {
+        if (i == preferred_profile) {
+            continue;
+        }
+        float look_x = 0.0f;
+        float look_y = 0.0f;
+        if (!try_get_control_profile_look_sensitivity(i, look_x, look_y)) {
+            continue;
+        }
+        if (!have_candidate) {
+            candidate_x = look_x;
+            candidate_y = look_y;
+            have_candidate = true;
+        }
+        if (is_nonzero_sensitivity(look_x, look_y)) {
+            out_x = look_x;
+            out_y = look_y;
+            return true;
+        }
+    }
+
+    // Secondary source: legacy gameplay aim sensitivity globals.
+    const float aim_x = rf2::os::input::mouse_aim_sensitivity_x; // flt_6F2038
+    const float aim_y = rf2::os::input::mouse_aim_sensitivity_y; // flt_6F2034
+    if (std::isfinite(aim_x) && std::isfinite(aim_y)) {
+        if (!have_candidate) {
+            candidate_x = aim_x;
+            candidate_y = aim_y;
+            have_candidate = true;
+        }
+        if (is_nonzero_sensitivity(aim_x, aim_y)) {
+            out_x = aim_x;
+            out_y = aim_y;
+            return true;
+        }
+    }
+
+    // Fallback: derive from runtime DirectInput mouse scaling path.
+    if (rf2::os::input::mouse_system_initialized != 0) {
+        const int range_x = rf2::os::input::mouse_range_x;
+        const int range_y = rf2::os::input::mouse_range_y;
+        const float raw_x = rf2::os::input::mouse_sensitivity_x;
+        const float raw_y = rf2::os::input::mouse_sensitivity_y;
+        if (range_x > 0 && range_y > 0 && std::isfinite(raw_x) && std::isfinite(raw_y)) {
+            constexpr float x_scale = 0.0015f;
+            constexpr float y_scale = 0.0020000001f;
+            const float arg0 = raw_x / (static_cast<float>(range_x) * x_scale);
+            const float arg1 = raw_y / (static_cast<float>(range_y) * y_scale);
+            if (std::isfinite(arg0) && std::isfinite(arg1)) {
+                // Inverse of RF2 controls formula used before sub_539AE0:
+                // arg0 = ((aim_y / 0.1) + 1) * 0.5
+                // arg1 = ((aim_x / 0.07) + 1) * 0.5
+                out_y = (arg0 * 2.0f - 1.0f) * 0.1f;
+                out_x = (arg1 * 2.0f - 1.0f) * 0.07f;
+                return std::isfinite(out_x) && std::isfinite(out_y);
+            }
+        }
+    }
+
+    if (have_candidate) {
+        out_x = candidate_x;
+        out_y = candidate_y;
+        return true;
+    }
+    return false;
+}
+
+bool apply_control_profile_look_sensitivity(float look_x, float look_y)
+{
+    if (!std::isfinite(look_x) || !std::isfinite(look_y)) {
+        return false;
+    }
+
+    const int profile_count = get_control_profile_count();
+    bool wrote_any = false;
+    for (int i = 0; i < profile_count; ++i) {
+        const uintptr_t profile_addr = get_control_profile_addr(i);
+        addr_as_ref<float>(profile_addr + rf2::os::input::control_profile_look_horizontal_sensitivity_offset) = look_x;
+        addr_as_ref<float>(profile_addr + rf2::os::input::control_profile_look_vertical_sensitivity_offset) = look_y;
+        wrote_any = true;
+    }
+    return wrote_any;
+}
+
+void apply_runtime_mouse_sensitivity(float aim_x, float aim_y)
+{
+    if (!std::isfinite(aim_x) || !std::isfinite(aim_y)) {
+        return;
+    }
+
+    if (rf2::os::input::mouse_system_initialized == 0) {
+        return;
+    }
+
+    // Match RF2 controls code path:
+    // arg0 = ((aim_y / 0.1) + 1) * 0.5
+    // arg1 = ((aim_x / 0.07) + 1) * 0.5
+    constexpr float aim_x_divisor = 0.07f;
+    constexpr float aim_y_divisor = 0.1f;
+    const float arg0 = ((aim_y / aim_y_divisor) + 1.0f) * 0.5f;
+    const float arg1 = ((aim_x / aim_x_divisor) + 1.0f) * 0.5f;
+    if (!std::isfinite(arg0) || !std::isfinite(arg1)) {
+        return;
+    }
+    rf2::os::input::mouse_set_sensitivity(arg0, arg1);
+}
+
+bool try_parse_positive_float(const std::string& text, float& out_value)
+{
+    size_t parsed_len = 0;
+    try {
+        out_value = std::stof(text, &parsed_len);
+    }
+    catch (...) {
+        return false;
+    }
+
+    if (parsed_len != text.size() || !std::isfinite(out_value) || out_value < 0.0f) {
+        return false;
+    }
+    return true;
 }
 
 void set_console_status_text(const char* text)
 {
-    if (g_console_status && IsWindow(g_console_status)) {
-        SetWindowTextA(g_console_status, text ? text : "");
-    }
+    g_console_status_text = text ? text : "";
 }
 
 void ensure_console_visual_resources()
@@ -263,8 +464,10 @@ void ensure_console_visual_resources()
     if (!g_console_bg_brush) {
         g_console_bg_brush = CreateSolidBrush(RGB(0, 0, 0));
     }
+    if (!g_console_border_brush) {
+        g_console_border_brush = CreateSolidBrush(console_border_color);
+    }
     if (!g_console_font) {
-        // Classic fixed-width console look.
         g_console_font = CreateFontA(
             -17,
             0,
@@ -286,41 +489,23 @@ void ensure_console_visual_resources()
     }
 }
 
-void apply_console_window_skin(HWND hwnd)
+int get_max_scroll_lines()
 {
-    if (!hwnd || !IsWindow(hwnd)) {
-        return;
-    }
-    ensure_console_visual_resources();
+    const int total_lines = static_cast<int>(g_console_output_lines.size());
+    return std::max(0, total_lines - g_console_visible_line_count);
+}
 
-    LONG ex_style = GetWindowLongA(hwnd, GWL_EXSTYLE);
-    ex_style |= WS_EX_LAYERED;
-    SetWindowLongA(hwnd, GWL_EXSTYLE, ex_style);
-    SetLayeredWindowAttributes(hwnd, 0, 224, LWA_ALPHA);
+void clamp_console_scroll()
+{
+    g_console_scroll_lines_from_bottom = std::clamp(
+        g_console_scroll_lines_from_bottom,
+        0,
+        get_max_scroll_lines());
 }
 
 void refresh_console_output_view()
 {
-    if (!g_console_output || !IsWindow(g_console_output)) {
-        return;
-    }
-
-    std::string joined;
-    joined.reserve(g_console_output_lines.size() * 48);
-    for (const auto& line : g_console_output_lines) {
-        joined += line;
-        joined += "\r\n";
-    }
-    SetWindowTextA(g_console_output, joined.c_str());
-    // Keep viewport pinned to the bottom so newest entries are always visible.
-    const LRESULT line_count = SendMessageA(g_console_output, EM_GETLINECOUNT, 0, 0);
-    SendMessageA(g_console_output, EM_SETSEL, static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
-    SendMessageA(g_console_output, EM_SCROLLCARET, 0, 0);
-    SendMessageA(g_console_output, WM_VSCROLL, static_cast<WPARAM>(SB_BOTTOM), 0);
-    if (line_count > 0) {
-        SendMessageA(g_console_output, EM_LINESCROLL, 0, static_cast<LPARAM>(line_count));
-    }
-    SendMessageA(g_console_output, WM_VSCROLL, static_cast<WPARAM>(SB_BOTTOM), 0);
+    clamp_console_scroll();
 }
 
 void suspend_console_output_refresh()
@@ -351,30 +536,30 @@ void refresh_console_output_if_needed()
 
 void scroll_console_output_to_top()
 {
-    if (!g_console_output || !IsWindow(g_console_output)) {
-        return;
-    }
-    SendMessageA(g_console_output, EM_SETSEL, 0, 0);
-    SendMessageA(g_console_output, EM_SCROLLCARET, 0, 0);
-    SendMessageA(g_console_output, WM_VSCROLL, static_cast<WPARAM>(SB_TOP), 0);
+    g_console_scroll_lines_from_bottom = get_max_scroll_lines();
 }
 
 void scroll_console_output_to_bottom()
 {
-    if (!g_console_output || !IsWindow(g_console_output)) {
-        return;
-    }
-    SendMessageA(g_console_output, EM_SETSEL, static_cast<WPARAM>(-1), static_cast<LPARAM>(-1));
-    SendMessageA(g_console_output, EM_SCROLLCARET, 0, 0);
-    SendMessageA(g_console_output, WM_VSCROLL, static_cast<WPARAM>(SB_BOTTOM), 0);
+    g_console_scroll_lines_from_bottom = 0;
 }
 
 void scroll_console_output_by(WPARAM scroll_cmd)
 {
-    if (!g_console_output || !IsWindow(g_console_output)) {
-        return;
+    const int step = std::max(1, g_console_visible_line_count - 2);
+    switch (scroll_cmd) {
+    case SB_PAGEUP:
+    case SB_LINEUP:
+        g_console_scroll_lines_from_bottom += step;
+        break;
+    case SB_PAGEDOWN:
+    case SB_LINEDOWN:
+        g_console_scroll_lines_from_bottom -= step;
+        break;
+    default:
+        break;
     }
-    SendMessageA(g_console_output, WM_VSCROLL, scroll_cmd, 0);
+    clamp_console_scroll();
 }
 
 void append_console_output_line(std::string line)
@@ -382,6 +567,10 @@ void append_console_output_line(std::string line)
     line = trim_ascii_copy(std::move(line));
     if (line.empty()) {
         return;
+    }
+
+    if (g_console_scroll_lines_from_bottom > 0) {
+        ++g_console_scroll_lines_from_bottom;
     }
 
     g_console_output_lines.push_back(std::move(line));
@@ -514,25 +703,13 @@ void reset_tab_completion_state()
 
 bool apply_console_edit_text(const std::string& text)
 {
-    if (!g_console_edit || !IsWindow(g_console_edit)) {
-        return false;
-    }
-    SetWindowTextA(g_console_edit, text.c_str());
-    SendMessageA(
-        g_console_edit,
-        EM_SETSEL,
-        static_cast<WPARAM>(text.size()),
-        static_cast<LPARAM>(text.size()));
+    g_console_input_text = text.substr(0, max_console_input_chars);
     return true;
 }
 
 bool tab_complete_console_input()
 {
-    if (!g_console_edit || !IsWindow(g_console_edit)) {
-        return false;
-    }
-
-    const std::string current = trim_ascii_copy(get_window_text(g_console_edit));
+    const std::string current = trim_ascii_copy(g_console_input_text);
     if (current.empty()) {
         set_console_status_text("Type part of a command, then press Tab.");
         reset_tab_completion_state();
@@ -677,39 +854,6 @@ bool print_rf2_command_help()
     return true;
 }
 
-HWND create_console_control(
-    HWND parent,
-    const char* class_name,
-    const char* text,
-    DWORD style,
-    int x,
-    int y,
-    int width,
-    int height,
-    int id)
-{
-    HWND control = CreateWindowExA(
-        0,
-        class_name,
-        text,
-        style,
-        x,
-        y,
-        width,
-        height,
-        parent,
-        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
-        GetModuleHandleA(nullptr),
-        nullptr);
-    if (control) {
-        ensure_console_visual_resources();
-        if (g_console_font) {
-            SendMessageA(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_console_font), TRUE);
-        }
-    }
-    return control;
-}
-
 LRESULT call_original_game_window_proc(HWND hwnd, UINT msg, WPARAM w_param, LPARAM l_param)
 {
     if (g_original_game_window_proc) {
@@ -835,7 +979,7 @@ void __cdecl console_print_hook(const char* text, int channel)
 
 void run_console_command_from_ui()
 {
-    const std::string command = trim_ascii_copy(get_window_text(g_console_edit));
+    const std::string command = trim_ascii_copy(g_console_input_text);
     if (command.empty()) {
         set_console_status_text("Enter a command.");
         return;
@@ -843,6 +987,71 @@ void run_console_command_from_ui()
 
     reset_tab_completion_state();
     append_console_output_line("> " + command);
+
+    if (starts_with_case_insensitive(command, "ms")) {
+        const bool has_token_boundary =
+            (command.size() == 2)
+            || std::isspace(static_cast<unsigned char>(command[2])) != 0;
+        if (has_token_boundary) {
+            const std::string arg_text = trim_ascii_copy(command.substr(2));
+            if (arg_text.empty()) {
+                float aim_x = 0.0f;
+                float aim_y = 0.0f;
+                if (try_get_mouse_aim_sensitivity(aim_x, aim_y)) {
+                    char line[160] = {};
+                    if (std::fabs(aim_x - aim_y) < 0.0001f) {
+                        std::snprintf(line, sizeof(line), "mouse sensitivity = %.6g", aim_x);
+                    }
+                    else {
+                        std::snprintf(line, sizeof(line), "mouse sensitivity x=%.6g y=%.6g", aim_x, aim_y);
+                    }
+                    append_console_output_line(line);
+                    set_console_status_text("Printed current sensitivity.");
+                }
+                else {
+                    append_console_output_line("Could not query gameplay mouse sensitivity.");
+                    set_console_status_text("Sensitivity query failed.");
+                }
+                g_console_input_text.clear();
+                return;
+            }
+
+            float value = 0.0f;
+            if (!try_parse_positive_float(arg_text, value)) {
+                append_console_output_line("Usage: ms <num>");
+                set_console_status_text("Invalid sensitivity value.");
+                g_console_input_text.clear();
+                return;
+            }
+
+            const bool updated_directinput_scale = misc_set_mouse_aim_sensitivity(value);
+            const bool updated_profile_table = apply_control_profile_look_sensitivity(value, value);
+            rf2::os::input::mouse_aim_sensitivity_x = value;
+            rf2::os::input::mouse_aim_sensitivity_y = value;
+            {
+                char line[128] = {};
+                std::snprintf(line, sizeof(line), "gameplay mouse sensitivity set to %.6g", value);
+                append_console_output_line(line);
+                if (updated_directinput_scale && rf2::os::input::mouse_system_initialized != 0) {
+                    set_console_status_text("Applied sensitivity.");
+                }
+                else if (updated_directinput_scale) {
+                    set_console_status_text("Applied gameplay sensitivity scale; runtime input not initialized.");
+                }
+                else if (updated_profile_table) {
+                    set_console_status_text("Applied gameplay sensitivity; DirectInput runtime not initialized.");
+                }
+                else if (rf2::os::input::mouse_system_initialized != 0) {
+                    set_console_status_text("Applied runtime sensitivity; gameplay profile table unavailable.");
+                }
+                else {
+                    set_console_status_text("Sensitivity saved; gameplay/runtime input not initialized yet.");
+                }
+            }
+            g_console_input_text.clear();
+            return;
+        }
+    }
 
     std::string custom_status;
     std::vector<std::string> custom_lines;
@@ -859,10 +1068,7 @@ void run_console_command_from_ui()
         else if (!custom_success) {
             set_console_status_text("Custom command failed.");
         }
-        if (g_console_edit && IsWindow(g_console_edit)) {
-            SetWindowTextA(g_console_edit, "");
-            SetFocus(g_console_edit);
-        }
+        g_console_input_text.clear();
         return;
     }
 
@@ -878,10 +1084,7 @@ void run_console_command_from_ui()
         else {
             set_console_status_text("No matching commands found.");
         }
-        if (g_console_edit && IsWindow(g_console_edit)) {
-            SetWindowTextA(g_console_edit, "");
-            SetFocus(g_console_edit);
-        }
+        g_console_input_text.clear();
         return;
     }
 
@@ -892,10 +1095,7 @@ void run_console_command_from_ui()
         else {
             set_console_status_text("Could not print RF2 command list.");
         }
-        if (g_console_edit && IsWindow(g_console_edit)) {
-            SetWindowTextA(g_console_edit, "");
-            SetFocus(g_console_edit);
-        }
+        g_console_input_text.clear();
         return;
     }
 
@@ -908,121 +1108,39 @@ void run_console_command_from_ui()
         std::snprintf(status, sizeof(status), "Command failed (code %d): %s", result, command.c_str());
     }
     set_console_status_text(status);
-    if (g_console_edit && IsWindow(g_console_edit)) {
-        SetWindowTextA(g_console_edit, "");
-        SetFocus(g_console_edit);
-    }
+    g_console_input_text.clear();
 }
 
 void hide_console_window(bool restore_game_focus)
 {
-    if (!g_console_hooked_game_window || !IsWindow(g_console_hooked_game_window)) {
-        return;
-    }
+    (void)restore_game_focus;
     reset_tab_completion_state();
     g_console_is_open = false;
     g_console_target_height = 0;
-    SetTimer(g_console_hooked_game_window, console_anim_timer_id, console_anim_timer_interval_ms, nullptr);
-    if (restore_game_focus && g_console_hooked_game_window && IsWindow(g_console_hooked_game_window)) {
-        ShowWindow(g_console_hooked_game_window, SW_RESTORE);
-        BringWindowToTop(g_console_hooked_game_window);
-        SetForegroundWindow(g_console_hooked_game_window);
-        SetActiveWindow(g_console_hooked_game_window);
-        SetFocus(g_console_hooked_game_window);
-    }
+
+    // Reset RF2 key state so gameplay controls do not bleed through while the SOPOT console is open/closing.
+    rf2::os::input::reset_key_state();
+    rf2::os::input::alt_key_down = 0;
+    rf2::os::input::tab_key_down = 0;
 }
 
-void layout_console_window()
+void update_console_target_height()
 {
-    if (!g_console_window || !IsWindow(g_console_window) || !g_console_hooked_game_window || !IsWindow(g_console_hooked_game_window)) {
+    if (!g_console_hooked_game_window || !IsWindow(g_console_hooked_game_window)) {
+        g_console_target_height = 0;
         return;
     }
 
     RECT parent_client{};
     GetClientRect(g_console_hooked_game_window, &parent_client);
-    const int parent_width = std::max<int>(parent_client.right - parent_client.left, 1);
     const int parent_height = std::max<int>(parent_client.bottom - parent_client.top, 1);
     const int max_open_height = std::max<int>(120, (parent_height * 4) / 5);
-    if (g_console_is_open) {
-        g_console_target_height = std::min<int>(console_open_height_px, max_open_height);
-    }
-    else {
-        g_console_target_height = 0;
-    }
-
-    const int height = std::clamp(g_console_current_height, 0, max_open_height);
-    POINT top_left{0, 0};
-    ClientToScreen(g_console_hooked_game_window, &top_left);
-    MoveWindow(g_console_window, top_left.x, top_left.y, parent_width, height, FALSE);
-
-    const int margin = 8;
-    const int input_h = 24;
-    const int gap = 8;
-    const int help_h = 20;
-    const int status_h = 18;
-    const int min_output_h = 24;
-    const int min_needed_h = (margin * 2) + input_h + gap + help_h + gap + status_h + gap + min_output_h;
-    const bool show_controls = height >= min_needed_h;
-
-    auto set_visible = [](HWND control, bool show) {
-        if (control && IsWindow(control)) {
-            ShowWindow(control, show ? SW_SHOWNA : SW_HIDE);
-        }
-    };
-
-    HWND label = GetDlgItem(g_console_window, id_console_label);
-    set_visible(label, show_controls);
-    set_visible(g_console_edit, show_controls);
-    set_visible(g_console_output, show_controls);
-    set_visible(g_console_status, show_controls);
-    if (!show_controls) {
-        return;
-    }
-
-    const int input_y = height - margin - input_h;
-    const int help_y = input_y - gap - help_h;
-    const int status_y = help_y - gap - status_h;
-    const int output_top = margin;
-    const int output_bottom = std::max<int>(output_top + min_output_h, status_y - gap);
-    const int output_h = std::max<int>(min_output_h, output_bottom - output_top);
-    const int content_w = std::max<int>(120, parent_width - (margin * 2));
-
-    if (label) {
-        MoveWindow(label, margin, help_y, content_w, help_h, TRUE);
-    }
-    if (g_console_edit && IsWindow(g_console_edit)) {
-        MoveWindow(g_console_edit, margin, input_y, content_w, input_h, TRUE);
-    }
-    if (g_console_output && IsWindow(g_console_output)) {
-        MoveWindow(g_console_output, margin, output_top, content_w, output_h, TRUE);
-    }
-    if (g_console_status && IsWindow(g_console_status)) {
-        MoveWindow(g_console_status, margin, status_y, content_w, status_h, TRUE);
-    }
-
-    // Keep painter order deterministic: output at back, status/help in middle, input on top.
-    if (g_console_output && IsWindow(g_console_output)) {
-        SetWindowPos(g_console_output, HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    }
-    if (g_console_status && IsWindow(g_console_status)) {
-        SetWindowPos(g_console_status, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    }
-    if (label) {
-        SetWindowPos(label, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    }
-    if (g_console_edit && IsWindow(g_console_edit)) {
-        SetWindowPos(g_console_edit, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    }
-
-    // Keep paint async to avoid hitching the game loop while the console animates.
-    InvalidateRect(g_console_window, nullptr, FALSE);
+    g_console_target_height = g_console_is_open ? std::min<int>(console_open_height_px, max_open_height) : 0;
 }
 
 void step_console_animation()
 {
-    if (!g_console_hooked_game_window || !IsWindow(g_console_hooked_game_window)) {
-        return;
-    }
+    update_console_target_height();
 
     if (g_console_current_height < g_console_target_height) {
         g_console_current_height = std::min(g_console_current_height + console_anim_step_px, g_console_target_height);
@@ -1030,271 +1148,248 @@ void step_console_animation()
     else if (g_console_current_height > g_console_target_height) {
         g_console_current_height = std::max(g_console_current_height - console_anim_step_px, g_console_target_height);
     }
+}
 
-    if (g_console_current_height <= 0) {
-        g_console_current_height = 0;
-        if (g_console_window && IsWindow(g_console_window)) {
-            ShowWindow(g_console_window, SW_HIDE);
-        }
-    }
-    else if (g_console_window && IsWindow(g_console_window)) {
-        ShowWindow(g_console_window, SW_SHOWNA);
+bool append_clipboard_text_to_input()
+{
+    if (!OpenClipboard(nullptr)) {
+        return false;
     }
 
-    layout_console_window();
-
-    if (g_console_current_height == g_console_target_height) {
-        KillTimer(g_console_hooked_game_window, console_anim_timer_id);
-        if (g_console_is_open && g_console_edit && IsWindow(g_console_edit)) {
-            SetForegroundWindow(g_console_window);
-            SetActiveWindow(g_console_window);
-            SetFocus(g_console_edit);
+    bool success = false;
+    HANDLE clip = GetClipboardData(CF_TEXT);
+    if (clip) {
+        const char* text = static_cast<const char*>(GlobalLock(clip));
+        if (text) {
+            for (const char* p = text; *p; ++p) {
+                const char c = *p;
+                if (c == '\r' || c == '\n' || c == '\t') {
+                    continue;
+                }
+                if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) > 126) {
+                    continue;
+                }
+                if (g_console_input_text.size() >= max_console_input_chars) {
+                    break;
+                }
+                g_console_input_text.push_back(c);
+            }
+            GlobalUnlock(clip);
+            success = true;
         }
+    }
+
+    CloseClipboard();
+    return success;
+}
+
+bool handle_console_keydown(WPARAM w_param)
+{
+    switch (w_param) {
+    case VK_RETURN:
+        run_console_command_from_ui();
+        return true;
+
+    case VK_TAB:
+        tab_complete_console_input();
+        return true;
+
+    case VK_BACK:
+        if (!g_console_input_text.empty()) {
+            g_console_input_text.pop_back();
+            reset_tab_completion_state();
+        }
+        return true;
+
+    case VK_ESCAPE:
+        hide_console_window(true);
+        return true;
+
+    case VK_PRIOR:
+        scroll_console_output_by(SB_PAGEUP);
+        return true;
+
+    case VK_NEXT:
+        scroll_console_output_by(SB_PAGEDOWN);
+        return true;
+
+    case VK_HOME:
+        scroll_console_output_to_top();
+        return true;
+
+    case VK_END:
+        scroll_console_output_to_bottom();
+        return true;
+
+    default:
+        if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && (w_param == 'V' || w_param == 'v')) {
+            append_clipboard_text_to_input();
+            reset_tab_completion_state();
+            return true;
+        }
+        else {
+            reset_tab_completion_state();
+        }
+        return true;
     }
 }
 
-bool ensure_console_window(HWND owner)
+void handle_console_char(WPARAM w_param)
 {
-    if (g_console_window && IsWindow(g_console_window)) {
-        return true;
+    if (w_param == '`' || w_param == '~') {
+        return;
     }
 
-    WNDCLASSA window_class{};
-    window_class.lpfnWndProc = console_window_proc;
-    window_class.hInstance = GetModuleHandleA(nullptr);
-    window_class.lpszClassName = rf2patch_console_class_name;
-    window_class.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    if (w_param < 32 || w_param > 126) {
+        return;
+    }
+
+    if (g_console_input_text.size() >= max_console_input_chars) {
+        return;
+    }
+
+    g_console_input_text.push_back(static_cast<char>(w_param));
+    reset_tab_completion_state();
+}
+
+void draw_console_overlay(HWND target_window)
+{
+    if (!target_window || !IsWindow(target_window)) {
+        return;
+    }
+
+    RECT client{};
+    if (!GetClientRect(target_window, &client)) {
+        return;
+    }
+    const int client_w = client.right - client.left;
+    const int client_h = client.bottom - client.top;
+    if (client_w <= 0 || client_h <= 0) {
+        return;
+    }
+
+    const int panel_h = std::clamp(g_console_current_height, 0, client_h);
+    if (panel_h <= 0) {
+        return;
+    }
+
+    HDC dc = GetDC(target_window);
+    if (!dc) {
+        return;
+    }
+
     ensure_console_visual_resources();
-    window_class.hbrBackground = g_console_bg_brush ? g_console_bg_brush : reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
-    if (!RegisterClassA(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        xlog::warn("Failed to register SOPOT console window class");
-        return false;
+
+    const int saved_dc = SaveDC(dc);
+    if (g_console_font) {
+        SelectObject(dc, g_console_font);
+    }
+    SetBkMode(dc, TRANSPARENT);
+
+    RECT panel_rect{0, 0, client_w, panel_h};
+    FillRect(dc, &panel_rect, g_console_bg_brush ? g_console_bg_brush : reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+    FrameRect(dc, &panel_rect, g_console_border_brush ? g_console_border_brush : reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+
+    TEXTMETRICA tm{};
+    GetTextMetricsA(dc, &tm);
+    const int line_h = std::max<int>(tm.tmHeight, 14);
+
+    const int margin = 8;
+    const int gap = 6;
+    const int input_y = panel_h - margin - line_h;
+    const int status_y = input_y - gap - line_h;
+    const int help_y = status_y - gap - line_h;
+    const int output_top = margin;
+    const int output_bottom = std::max<int>(output_top, help_y - gap);
+
+    RECT output_rect{margin, output_top, std::max<int>(margin, client_w - margin), output_bottom};
+    if (output_rect.bottom > output_rect.top + 4) {
+        FrameRect(dc, &output_rect, g_console_border_brush ? g_console_border_brush : reinterpret_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
     }
 
-    owner = resolve_target_window(owner);
-    if (!owner || !IsWindow(owner)) {
-        return false;
+    SetTextColor(dc, console_hint_color);
+    TextOutA(dc, margin, help_y, console_help_text, static_cast<int>(std::strlen(console_help_text)));
+
+    SetTextColor(dc, console_status_color);
+    TextOutA(dc, margin, status_y, g_console_status_text.c_str(), static_cast<int>(g_console_status_text.size()));
+
+    int output_inner_h = std::max<int>(0, static_cast<int>(output_rect.bottom - output_rect.top) - 6);
+    g_console_visible_line_count = std::max(1, output_inner_h / line_h);
+    clamp_console_scroll();
+
+    if (output_inner_h > 0) {
+        const int saved_clip = SaveDC(dc);
+        IntersectClipRect(dc, output_rect.left + 3, output_rect.top + 3, output_rect.right - 3, output_rect.bottom - 3);
+
+        SetTextColor(dc, console_text_color);
+        const int total_lines = static_cast<int>(g_console_output_lines.size());
+        const int first_line = std::max(0, total_lines - g_console_visible_line_count - g_console_scroll_lines_from_bottom);
+        for (int i = 0; i < g_console_visible_line_count; ++i) {
+            const int idx = first_line + i;
+            if (idx < 0 || idx >= total_lines) {
+                continue;
+            }
+            const int y = output_rect.top + 3 + (i * line_h);
+            const auto& line = g_console_output_lines[static_cast<size_t>(idx)];
+            TextOutA(dc, output_rect.left + 6, y, line.c_str(), static_cast<int>(line.size()));
+        }
+
+        RestoreDC(dc, saved_clip);
     }
-    g_console_hooked_game_window = owner;
 
-    RECT owner_client{};
-    GetClientRect(owner, &owner_client);
-    POINT owner_top_left{0, 0};
-    ClientToScreen(owner, &owner_top_left);
+    SetTextColor(dc, console_text_color);
+    std::string input_line = "> " + g_console_input_text;
+    if (g_console_is_open) {
+        input_line.push_back('_');
+    }
+    const int max_input_w = std::max(32, client_w - (margin * 2));
+    while (!input_line.empty()) {
+        SIZE text_size{};
+        if (!GetTextExtentPoint32A(dc, input_line.c_str(), static_cast<int>(input_line.size()), &text_size) || text_size.cx <= max_input_w) {
+            break;
+        }
+        input_line.erase(input_line.begin());
+    }
+    TextOutA(dc, margin, input_y, input_line.c_str(), static_cast<int>(input_line.size()));
 
-    g_console_window = CreateWindowExA(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED | WS_EX_CONTROLPARENT,
-        rf2patch_console_class_name,
-        "SOPOT Developer Console",
-        WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
-        owner_top_left.x,
-        owner_top_left.y,
-        std::max<LONG>(owner_client.right - owner_client.left, 1),
-        1,
-        nullptr,
-        nullptr,
-        GetModuleHandleA(nullptr),
-        nullptr);
-    if (!g_console_window) {
-        xlog::warn("Failed to create SOPOT developer console window");
-        return false;
+    if (g_console_scroll_lines_from_bottom > 0) {
+        char scroll_info[96] = {};
+        std::snprintf(scroll_info, sizeof(scroll_info), "(%d lines up)", g_console_scroll_lines_from_bottom);
+        SIZE text_size{};
+        GetTextExtentPoint32A(dc, scroll_info, static_cast<int>(std::strlen(scroll_info)), &text_size);
+        SetTextColor(dc, console_hint_color);
+        TextOutA(
+            dc,
+            std::max<int>(margin, client_w - margin - static_cast<int>(text_size.cx)),
+            margin + 1,
+            scroll_info,
+            static_cast<int>(std::strlen(scroll_info)));
     }
 
-    apply_console_window_skin(g_console_window);
-    SetWindowPos(g_console_window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-    ShowWindow(g_console_window, SW_HIDE);
-    return true;
+    GdiFlush();
+    RestoreDC(dc, saved_dc);
+    ReleaseDC(target_window, dc);
 }
 
 void toggle_console_window(HWND owner)
 {
-    if (!ensure_console_window(owner)) {
-        return;
-    }
-
     owner = resolve_target_window(owner);
     if (!owner || !IsWindow(owner)) {
         return;
     }
+
     g_console_hooked_game_window = owner;
     g_console_is_open = !g_console_is_open;
+    reset_tab_completion_state();
     if (g_console_is_open) {
-        set_console_status_text("Ready. Enter RF2 command and press Enter or Run.");
-    }
-    layout_console_window();
-    SetTimer(g_console_hooked_game_window, console_anim_timer_id, console_anim_timer_interval_ms, nullptr);
-    step_console_animation();
-}
-
-LRESULT CALLBACK console_edit_proc(HWND hwnd, UINT msg, WPARAM w_param, LPARAM l_param)
-{
-    if (msg == WM_KEYDOWN) {
-        if (w_param == VK_OEM_3) {
-            return 0;
-        }
-        if (w_param == VK_PRIOR) {
-            scroll_console_output_by(SB_PAGEUP);
-            return 0;
-        }
-        if (w_param == VK_NEXT) {
-            scroll_console_output_by(SB_PAGEDOWN);
-            return 0;
-        }
-        if (w_param == VK_HOME) {
-            scroll_console_output_to_top();
-            return 0;
-        }
-        if (w_param == VK_END) {
-            scroll_console_output_to_bottom();
-            return 0;
-        }
-        if (w_param == VK_TAB) {
-            tab_complete_console_input();
-            return 0;
-        }
-        if (w_param == VK_RETURN) {
-            run_console_command_from_ui();
-            return 0;
-        }
-        if (w_param == VK_ESCAPE) {
-            reset_tab_completion_state();
-            hide_console_window(true);
-            return 0;
-        }
-        reset_tab_completion_state();
-    }
-    if (msg == WM_KEYUP && w_param == VK_OEM_3) {
-        reset_tab_completion_state();
-        hide_console_window(true);
-        return 0;
-    }
-    if ((msg == WM_CHAR || msg == WM_SYSCHAR) && (w_param == '`' || w_param == '~')) {
-        return 0;
+        set_console_status_text("Ready. Enter RF2 command and press Enter.");
+        scroll_console_output_to_bottom();
     }
 
-    if (g_original_console_edit_proc) {
-        return CallWindowProcA(g_original_console_edit_proc, hwnd, msg, w_param, l_param);
-    }
-    return DefWindowProcA(hwnd, msg, w_param, l_param);
-}
-
-LRESULT CALLBACK console_window_proc(HWND hwnd, UINT msg, WPARAM w_param, LPARAM l_param)
-{
-    switch (msg) {
-    case WM_CREATE: {
-        create_console_control(
-            hwnd,
-            "STATIC",
-            "Input: Enter execute, Tab complete, . <text> search, fov/maxfps/r_showfps/directinput/aimslow/enemycrosshair, ~ toggle",
-            WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_NOPREFIX,
-            10,
-            10,
-            220,
-            18,
-            id_console_label);
-        g_console_edit = create_console_control(
-            hwnd,
-            "EDIT",
-            "",
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL,
-            10,
-            30,
-            734,
-            24,
-            id_console_edit);
-        g_console_output = create_console_control(
-            hwnd,
-            "EDIT",
-            "",
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_LEFT | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY | WS_VSCROLL,
-            10,
-            62,
-            734,
-            286,
-            id_console_output);
-        g_console_status = create_console_control(
-            hwnd,
-            "STATIC",
-            "Ready.",
-            WS_CHILD | WS_VISIBLE | SS_LEFTNOWORDWRAP | SS_NOPREFIX,
-            10,
-            354,
-            734,
-            18,
-            id_console_status);
-
-        if (g_console_edit) {
-            auto prev_proc = SetWindowLongPtrA(
-                g_console_edit,
-                GWLP_WNDPROC,
-                reinterpret_cast<LONG_PTR>(console_edit_proc));
-            g_original_console_edit_proc = reinterpret_cast<WndProcFn>(prev_proc);
-        }
-        refresh_console_output_view();
-        return 0;
-    }
-
-    case WM_SIZE:
-        layout_console_window();
-        return 0;
-
-    case WM_ERASEBKGND: {
-        RECT rc{};
-        GetClientRect(hwnd, &rc);
-        ensure_console_visual_resources();
-        FillRect(
-            reinterpret_cast<HDC>(w_param),
-            &rc,
-            g_console_bg_brush ? g_console_bg_brush : reinterpret_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
-        return 1;
-    }
-
-    case WM_SETFOCUS:
-        if (g_console_edit && IsWindow(g_console_edit)) {
-            SetFocus(g_console_edit);
-            return 0;
-        }
-        break;
-
-    case WM_CTLCOLOREDIT:
-    case WM_CTLCOLORSTATIC: {
-        HDC dc = reinterpret_cast<HDC>(w_param);
-        HWND control = reinterpret_cast<HWND>(l_param);
-        ensure_console_visual_resources();
-        SetBkMode(dc, OPAQUE);
-        SetBkColor(dc, RGB(0, 0, 0));
-        if (control == g_console_status) {
-            SetTextColor(dc, console_status_color);
-        }
-        else {
-            SetTextColor(dc, console_text_color);
-        }
-        return reinterpret_cast<INT_PTR>(g_console_bg_brush ? g_console_bg_brush : GetStockObject(BLACK_BRUSH));
-    }
-
-    case WM_COMMAND: {
-        return 0;
-    }
-
-    case WM_CLOSE:
-        hide_console_window(true);
-        return 0;
-
-    case WM_DESTROY:
-        g_console_window = nullptr;
-        g_console_edit = nullptr;
-        g_console_output = nullptr;
-        g_console_status = nullptr;
-        g_original_console_edit_proc = nullptr;
-        g_console_current_height = 0;
-        g_console_target_height = 0;
-        g_console_is_open = false;
-        return 0;
-
-    default:
-        break;
-    }
-    return DefWindowProcA(hwnd, msg, w_param, l_param);
+    // Reset RF2 key state so gameplay controls do not bleed through while toggling console mode.
+    rf2::os::input::reset_key_state();
+    rf2::os::input::alt_key_down = 0;
+    rf2::os::input::tab_key_down = 0;
 }
 
 LRESULT CALLBACK game_window_proc_hook(HWND hwnd, UINT msg, WPARAM w_param, LPARAM l_param)
@@ -1305,12 +1400,19 @@ LRESULT CALLBACK game_window_proc_hook(HWND hwnd, UINT msg, WPARAM w_param, LPAR
         if (w_param == VK_OEM_3) {
             return 0;
         }
+        if (g_console_is_open) {
+            handle_console_keydown(w_param);
+            return 0;
+        }
         break;
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
         if (w_param == VK_OEM_3) {
             toggle_console_window(hwnd);
+            return 0;
+        }
+        if (g_console_is_open) {
             return 0;
         }
         break;
@@ -1320,33 +1422,19 @@ LRESULT CALLBACK game_window_proc_hook(HWND hwnd, UINT msg, WPARAM w_param, LPAR
         if (w_param == '`' || w_param == '~') {
             return 0;
         }
-        break;
-
-    case WM_TIMER:
-        if (w_param == console_anim_timer_id) {
-            step_console_animation();
+        if (g_console_is_open) {
+            handle_console_char(w_param);
             return 0;
         }
         break;
 
-    case WM_SIZE:
-        layout_console_window();
-        break;
-
     case WM_NCDESTROY:
-        KillTimer(hwnd, console_anim_timer_id);
-        if (g_console_window && IsWindow(g_console_window)) {
-            DestroyWindow(g_console_window);
-        }
-        g_console_window = nullptr;
-        g_console_edit = nullptr;
-        g_console_output = nullptr;
-        g_console_status = nullptr;
-        g_original_console_edit_proc = nullptr;
         g_console_hooked_game_window = nullptr;
         g_console_current_height = 0;
         g_console_target_height = 0;
         g_console_is_open = false;
+        g_console_input_text.clear();
+        reset_tab_completion_state();
         break;
 
     default:
@@ -1398,7 +1486,6 @@ void install_game_window_proc_hook(HWND window)
 
     g_original_game_window_proc = reinterpret_cast<WndProcFn>(previous_proc);
     g_console_hooked_game_window = window;
-    layout_console_window();
 }
 
 } // namespace
@@ -1417,4 +1504,27 @@ void console_attach_to_window(HWND window)
 bool console_is_open()
 {
     return g_console_is_open;
+}
+
+void console_on_present(HWND target_window)
+{
+    HWND resolved = resolve_target_window(target_window ? target_window : g_console_hooked_game_window);
+    if (!resolved || !IsWindow(resolved)) {
+        return;
+    }
+    g_console_hooked_game_window = resolved;
+
+    step_console_animation();
+    if (!g_console_is_open && g_console_current_height <= 0) {
+        return;
+    }
+
+    if (g_console_is_open) {
+        // Keep RF2 key-state arrays from retaining gameplay input while console mode is active.
+        rf2::os::input::reset_key_state();
+        rf2::os::input::alt_key_down = 0;
+        rf2::os::input::tab_key_down = 0;
+    }
+
+    draw_console_overlay(resolved);
 }

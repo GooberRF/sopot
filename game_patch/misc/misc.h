@@ -22,6 +22,7 @@ struct Rf2PatchSettings
     bool aim_slowdown_on_target = true;
     bool crosshair_enemy_indicator = true;
     bool r_showfps = false;
+    bool experimental_fps_stabilization = false;
     std::string settings_file_path{};
 };
 
@@ -32,3 +33,6 @@ bool misc_try_handle_console_command(
     bool& out_success,
     std::string& out_status,
     std::vector<std::string>& out_output_lines);
+
+bool misc_set_mouse_aim_sensitivity(float value);
+bool misc_get_mouse_aim_sensitivity(float& out_value);

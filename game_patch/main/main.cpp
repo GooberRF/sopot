@@ -212,6 +212,9 @@ static Rf2PatchSettings load_patch_settings()
         else if (key == "r_showfps") {
             settings.r_showfps = parse_bool_value(value);
         }
+        else if (key == "experimental_fps_stabilization") {
+            settings.experimental_fps_stabilization = parse_bool_value(value);
+        }
     }
 
     const char* mode_name = "windowed";
@@ -223,7 +226,7 @@ static Rf2PatchSettings load_patch_settings()
     }
 
     xlog::info(
-        "Loaded settings from {}: window_mode={}, resolution={}x{}, fast_start={}, vsync={}, direct_input_mouse={}, aim_slowdown_on_target={}, crosshair_enemy_indicator={}, r_showfps={}, fov={}, max_fps={}",
+        "Loaded settings from {}: window_mode={}, resolution={}x{}, fast_start={}, vsync={}, direct_input_mouse={}, aim_slowdown_on_target={}, crosshair_enemy_indicator={}, r_showfps={}, experimental_fps_stabilization={}, fov={}, max_fps={}",
         settings_path,
         mode_name,
         settings.window_width,
@@ -234,6 +237,7 @@ static Rf2PatchSettings load_patch_settings()
         settings.aim_slowdown_on_target ? 1 : 0,
         settings.crosshair_enemy_indicator ? 1 : 0,
         settings.r_showfps ? 1 : 0,
+        settings.experimental_fps_stabilization ? 1 : 0,
         settings.fov,
         settings.max_fps);
     return settings;

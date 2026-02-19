@@ -15,8 +15,8 @@ namespace
 {
 
 constexpr float min_configurable_max_fps = 10.0f;
-constexpr float max_configurable_max_fps = 1000.0f;
-constexpr float default_max_fps = 0.0f; // uncapped
+constexpr float max_configurable_max_fps = 240.0f;
+constexpr float default_max_fps = 240.0f;
 constexpr float default_frametime_min = 0.0f;
 constexpr float default_frametime_max = 0.25f;
 constexpr COLORREF fps_overlay_color = RGB(0, 255, 0);
@@ -27,6 +27,7 @@ constexpr int fps_overlay_height_px = 48;
 float g_max_fps = default_max_fps;
 bool g_vsync_enabled = false;
 bool g_show_fps_overlay = false;
+bool g_experimental_fps_stabilization_enabled = false;
 std::string g_settings_path{};
 bool g_logged_vsync_disable = false;
 bool g_hooks_installed = false;
@@ -397,15 +398,32 @@ void frame_limiter_apply_settings(const Rf2PatchSettings& settings)
     g_max_fps = clamp_max_fps(requested_max_fps);
     g_vsync_enabled = settings.vsync;
     g_show_fps_overlay = settings.r_showfps;
+    g_experimental_fps_stabilization_enabled = settings.experimental_fps_stabilization;
     g_logged_vsync_disable = false;
 
-    install_hooks_if_needed();
     frame_limiter_apply_runtime_overrides();
-    apply_frametime_limits(true);
     reset_present_limiter_state();
 
+    if (!g_experimental_fps_stabilization_enabled) {
+        xlog::info(
+            "Experimental FPS stabilization is disabled (experimental_fps_stabilization=0).");
+        if (requested_max_fps > 0.0f) {
+            xlog::warn(
+                "max_fps={} configured but experimental FPS stabilization is disabled; render cap will not be enforced.",
+                requested_max_fps);
+        }
+        if (g_show_fps_overlay) {
+            xlog::warn(
+                "r_showfps=1 configured but experimental FPS stabilization is disabled; FPS overlay will not be shown.");
+        }
+        return;
+    }
+
+    install_hooks_if_needed();
+    apply_frametime_limits(true);
+
     xlog::info(
-        "Applied frame limiter settings: requested_max_fps={}, effective_max_fps={} (0=uncapped), vsync={}, r_showfps={} (render cap in Present)",
+        "Applied frame limiter settings (experimental): requested_max_fps={}, effective_max_fps={} (0=uncapped), vsync={}, r_showfps={} (render cap in Present)",
         requested_max_fps,
         get_effective_max_fps(),
         g_vsync_enabled ? 1 : 0,
@@ -424,7 +442,7 @@ void frame_limiter_apply_settings(const Rf2PatchSettings& settings)
 
 bool frame_limiter_is_active()
 {
-    return true;
+    return g_experimental_fps_stabilization_enabled;
 }
 
 bool frame_limiter_is_vsync_enabled()
@@ -434,12 +452,18 @@ bool frame_limiter_is_vsync_enabled()
 
 void frame_limiter_on_device_reset()
 {
+    if (!g_experimental_fps_stabilization_enabled) {
+        return;
+    }
     apply_frametime_limits(false);
     reset_present_limiter_state();
 }
 
 void frame_limiter_on_present()
 {
+    if (!g_experimental_fps_stabilization_enabled) {
+        return;
+    }
     frame_limiter_apply_runtime_overrides();
     enforce_present_fps_cap();
     update_fps_metrics();
@@ -506,7 +530,17 @@ bool frame_limiter_try_handle_console_command(
     out_output_lines.clear();
 
     const std::string trimmed = trim_ascii_copy(command);
-    if (starts_with_case_insensitive(trimmed, "r_showfps")) {
+    const bool is_showfps_command = starts_with_case_insensitive(trimmed, "r_showfps");
+    const bool is_maxfps_command = starts_with_case_insensitive(trimmed, "maxfps");
+
+    if (!g_experimental_fps_stabilization_enabled && (is_showfps_command || is_maxfps_command)) {
+        out_output_lines.emplace_back("Experimental FPS stabilization is disabled.");
+        out_output_lines.emplace_back("Enable sopot_settings.ini option: experimental_fps_stabilization=1");
+        out_status = "FPS stabilization command unavailable while experimental option is disabled.";
+        return true;
+    }
+
+    if (is_showfps_command) {
         const std::string arg_text = trim_ascii_copy(trimmed.substr(9));
         if (arg_text.empty()) {
             char line[96] = {};
@@ -534,7 +568,7 @@ bool frame_limiter_try_handle_console_command(
         return true;
     }
 
-    if (!starts_with_case_insensitive(trimmed, "maxfps")) {
+    if (!is_maxfps_command) {
         return false;
     }
 

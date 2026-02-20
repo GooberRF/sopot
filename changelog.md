@@ -28,10 +28,12 @@ Version 1.0.0: Not yet released
   - `directinput` / `dinput`
   - `aimslow`
   - `enemycrosshair`
+  - `ms`
 - Added launcher About dialog with links to local project documentation.
 - Added SOPOT launcher and game patch bootstrap flow for Red Faction II.
 - Added launcher-managed settings in `sopot_settings.ini`.
 - Added runtime DLL injection flow for `rf2.exe`.
+- Integrated `d3d8to9` into SOPOT build/runtime flow
 
 ### Compatibility and fixes
 [@GooberRF](https://github.com/GooberRF)

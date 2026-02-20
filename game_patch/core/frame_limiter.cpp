@@ -412,10 +412,6 @@ void frame_limiter_apply_settings(const Rf2PatchSettings& settings)
                 "max_fps={} configured but experimental FPS stabilization is disabled; render cap will not be enforced.",
                 requested_max_fps);
         }
-        if (g_show_fps_overlay) {
-            xlog::warn(
-                "r_showfps=1 configured but experimental FPS stabilization is disabled; FPS overlay will not be shown.");
-        }
         return;
     }
 
@@ -461,12 +457,13 @@ void frame_limiter_on_device_reset()
 
 void frame_limiter_on_present()
 {
-    if (!g_experimental_fps_stabilization_enabled) {
-        return;
-    }
     frame_limiter_apply_runtime_overrides();
-    enforce_present_fps_cap();
-    update_fps_metrics();
+    if (g_experimental_fps_stabilization_enabled) {
+        enforce_present_fps_cap();
+    }
+    if (g_show_fps_overlay) {
+        update_fps_metrics();
+    }
 }
 
 void frame_limiter_draw_overlay(HWND target_window)
@@ -533,7 +530,7 @@ bool frame_limiter_try_handle_console_command(
     const bool is_showfps_command = starts_with_case_insensitive(trimmed, "r_showfps");
     const bool is_maxfps_command = starts_with_case_insensitive(trimmed, "maxfps");
 
-    if (!g_experimental_fps_stabilization_enabled && (is_showfps_command || is_maxfps_command)) {
+    if (!g_experimental_fps_stabilization_enabled && is_maxfps_command) {
         out_output_lines.emplace_back("Experimental FPS stabilization is disabled.");
         out_output_lines.emplace_back("Enable sopot_settings.ini option: experimental_fps_stabilization=1");
         out_status = "FPS stabilization command unavailable while experimental option is disabled.";

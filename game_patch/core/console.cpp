@@ -69,7 +69,7 @@ void append_rf2patch_builtin_commands(std::vector<ConsoleCommandInfo>& commands)
 {
     commands.push_back({"fov", "fov <num> (0 = auto-scale from 90 at 4:3)"});
     commands.push_back({"maxfps", "maxfps <num> (experimental; 0 = uncapped; render cap applied in Present)"});
-    commands.push_back({"r_showfps", "r_showfps <0|1> (experimental; draw simulation/render FPS in top-right overlay)"});
+    commands.push_back({"r_showfps", "r_showfps <0|1> (draw simulation/render FPS in top-right overlay)"});
     commands.push_back({"ms", "ms <num> (set gameplay mouse aim sensitivity; no arg prints current value)"});
     commands.push_back({"directinput", "directinput <0|1> (toggle DirectInput mouse for menus/gameplay)"});
     commands.push_back({"aimslow", "aimslow <0|1> (toggle target-on-enemy aim slowdown)"});
@@ -301,6 +301,26 @@ bool is_nonzero_sensitivity(float x, float y)
     return std::fabs(x) > epsilon || std::fabs(y) > epsilon;
 }
 
+constexpr float aim_x_divisor = 0.07f;
+constexpr float aim_y_divisor = 0.1f;
+
+bool convert_raw_aim_to_uniform_sensitivity(float aim_x, float aim_y, float& out_x, float& out_y)
+{
+    if (!std::isfinite(aim_x) || !std::isfinite(aim_y)) {
+        return false;
+    }
+
+    out_x = aim_x / aim_x_divisor;
+    out_y = aim_y / aim_y_divisor;
+    return std::isfinite(out_x) && std::isfinite(out_y);
+}
+
+void convert_uniform_to_raw_aim_sensitivity(float uniform, float& out_aim_x, float& out_aim_y)
+{
+    out_aim_x = uniform * aim_x_divisor;
+    out_aim_y = uniform * aim_y_divisor;
+}
+
 bool try_get_mouse_aim_sensitivity(float& out_x, float& out_y)
 {
     float patch_scale = 0.0f;
@@ -318,13 +338,17 @@ bool try_get_mouse_aim_sensitivity(float& out_x, float& out_y)
     if (preferred_profile >= 0) {
         float look_x = 0.0f;
         float look_y = 0.0f;
-        if (try_get_control_profile_look_sensitivity(preferred_profile, look_x, look_y)) {
-            candidate_x = look_x;
-            candidate_y = look_y;
+        float uniform_x = 0.0f;
+        float uniform_y = 0.0f;
+        if (try_get_control_profile_look_sensitivity(preferred_profile, look_x, look_y)
+            && convert_raw_aim_to_uniform_sensitivity(look_x, look_y, uniform_x, uniform_y))
+        {
+            candidate_x = uniform_x;
+            candidate_y = uniform_y;
             have_candidate = true;
-            if (is_nonzero_sensitivity(look_x, look_y)) {
-                out_x = look_x;
-                out_y = look_y;
+            if (is_nonzero_sensitivity(uniform_x, uniform_y)) {
+                out_x = uniform_x;
+                out_y = uniform_y;
                 return true;
             }
         }
@@ -337,17 +361,21 @@ bool try_get_mouse_aim_sensitivity(float& out_x, float& out_y)
         }
         float look_x = 0.0f;
         float look_y = 0.0f;
-        if (!try_get_control_profile_look_sensitivity(i, look_x, look_y)) {
+        float uniform_x = 0.0f;
+        float uniform_y = 0.0f;
+        if (!try_get_control_profile_look_sensitivity(i, look_x, look_y)
+            || !convert_raw_aim_to_uniform_sensitivity(look_x, look_y, uniform_x, uniform_y))
+        {
             continue;
         }
         if (!have_candidate) {
-            candidate_x = look_x;
-            candidate_y = look_y;
+            candidate_x = uniform_x;
+            candidate_y = uniform_y;
             have_candidate = true;
         }
-        if (is_nonzero_sensitivity(look_x, look_y)) {
-            out_x = look_x;
-            out_y = look_y;
+        if (is_nonzero_sensitivity(uniform_x, uniform_y)) {
+            out_x = uniform_x;
+            out_y = uniform_y;
             return true;
         }
     }
@@ -355,15 +383,17 @@ bool try_get_mouse_aim_sensitivity(float& out_x, float& out_y)
     // Secondary source: legacy gameplay aim sensitivity globals.
     const float aim_x = rf2::os::input::mouse_aim_sensitivity_x; // flt_6F2038
     const float aim_y = rf2::os::input::mouse_aim_sensitivity_y; // flt_6F2034
-    if (std::isfinite(aim_x) && std::isfinite(aim_y)) {
+    float uniform_x = 0.0f;
+    float uniform_y = 0.0f;
+    if (convert_raw_aim_to_uniform_sensitivity(aim_x, aim_y, uniform_x, uniform_y)) {
         if (!have_candidate) {
-            candidate_x = aim_x;
-            candidate_y = aim_y;
+            candidate_x = uniform_x;
+            candidate_y = uniform_y;
             have_candidate = true;
         }
-        if (is_nonzero_sensitivity(aim_x, aim_y)) {
-            out_x = aim_x;
-            out_y = aim_y;
+        if (is_nonzero_sensitivity(uniform_x, uniform_y)) {
+            out_x = uniform_x;
+            out_y = uniform_y;
             return true;
         }
     }
@@ -380,12 +410,14 @@ bool try_get_mouse_aim_sensitivity(float& out_x, float& out_y)
             const float arg0 = raw_x / (static_cast<float>(range_x) * x_scale);
             const float arg1 = raw_y / (static_cast<float>(range_y) * y_scale);
             if (std::isfinite(arg0) && std::isfinite(arg1)) {
+                float raw_aim_x = 0.0f;
+                float raw_aim_y = 0.0f;
                 // Inverse of RF2 controls formula used before sub_539AE0:
                 // arg0 = ((aim_y / 0.1) + 1) * 0.5
                 // arg1 = ((aim_x / 0.07) + 1) * 0.5
-                out_y = (arg0 * 2.0f - 1.0f) * 0.1f;
-                out_x = (arg1 * 2.0f - 1.0f) * 0.07f;
-                return std::isfinite(out_x) && std::isfinite(out_y);
+                raw_aim_y = (arg0 * 2.0f - 1.0f) * aim_y_divisor;
+                raw_aim_x = (arg1 * 2.0f - 1.0f) * aim_x_divisor;
+                return convert_raw_aim_to_uniform_sensitivity(raw_aim_x, raw_aim_y, out_x, out_y);
             }
         }
     }
@@ -428,8 +460,6 @@ void apply_runtime_mouse_sensitivity(float aim_x, float aim_y)
     // Match RF2 controls code path:
     // arg0 = ((aim_y / 0.1) + 1) * 0.5
     // arg1 = ((aim_x / 0.07) + 1) * 0.5
-    constexpr float aim_x_divisor = 0.07f;
-    constexpr float aim_y_divisor = 0.1f;
     const float arg0 = ((aim_y / aim_y_divisor) + 1.0f) * 0.5f;
     const float arg1 = ((aim_x / aim_x_divisor) + 1.0f) * 0.5f;
     if (!std::isfinite(arg0) || !std::isfinite(arg1)) {
@@ -1024,10 +1054,13 @@ void run_console_command_from_ui()
                 return;
             }
 
+            float raw_aim_x = 0.0f;
+            float raw_aim_y = 0.0f;
+            convert_uniform_to_raw_aim_sensitivity(value, raw_aim_x, raw_aim_y);
             const bool updated_directinput_scale = misc_set_mouse_aim_sensitivity(value);
-            const bool updated_profile_table = apply_control_profile_look_sensitivity(value, value);
-            rf2::os::input::mouse_aim_sensitivity_x = value;
-            rf2::os::input::mouse_aim_sensitivity_y = value;
+            const bool updated_profile_table = apply_control_profile_look_sensitivity(raw_aim_x, raw_aim_y);
+            rf2::os::input::mouse_aim_sensitivity_x = raw_aim_x;
+            rf2::os::input::mouse_aim_sensitivity_y = raw_aim_y;
             {
                 char line[128] = {};
                 std::snprintf(line, sizeof(line), "gameplay mouse sensitivity set to %.6g", value);

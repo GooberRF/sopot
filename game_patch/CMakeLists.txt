@@ -50,3 +50,6 @@ target_link_libraries(Sopot
     Common
     CrashHandlerStub
 )
+
+# Keep d3d8to9.dll built alongside Sopot so runtime D3D8->D3D9 translation is available.
+add_dependencies(Sopot d3d8to9)

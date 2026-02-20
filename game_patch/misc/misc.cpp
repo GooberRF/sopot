@@ -10,6 +10,7 @@
 #include "../rf2/player/camera.h"
 #include "../rf2/player/reticle.h"
 #include "../rf2/rf2.h"
+#include <common/utils/os-utils.h>
 #include <patch_common/FunHook.h>
 #include <patch_common/AsmOpcodes.h>
 #include <patch_common/AsmWriter.h>
@@ -203,6 +204,7 @@ HWND g_game_window = nullptr;
 CreateDeviceFn g_original_create_device = nullptr;
 ResetFn g_original_reset = nullptr;
 PresentFn g_original_present = nullptr;
+Direct3DCreate8Fn g_d3d8to9_create8_export = nullptr;
 ShowWindowFn g_original_show_window = nullptr;
 ShowWindowAsyncFn g_original_show_window_async = nullptr;
 SetWindowPosFn g_original_set_window_pos = nullptr;
@@ -218,6 +220,51 @@ int g_active_override_log_count = 0;
 int g_input_flush_log_count = 0;
 int g_fast_start_log_count = 0;
 int g_direct_input_log_count = 0;
+
+std::string get_patch_module_dir()
+{
+    HMODULE patch_module = nullptr;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCSTR>(&g_settings),
+            &patch_module)) {
+        xlog::warn("GetModuleHandleExA failed for SOPOT module (error {})", GetLastError());
+        return {};
+    }
+    return get_module_dir(patch_module);
+}
+
+void init_d3d8to9_bridge()
+{
+    static bool initialized = false;
+    if (initialized) {
+        return;
+    }
+    initialized = true;
+
+    std::string module_dir = get_patch_module_dir();
+    if (module_dir.empty()) {
+        xlog::warn("Could not resolve SOPOT module directory for d3d8to9");
+        return;
+    }
+
+    const std::string d3d8to9_path = module_dir + "d3d8to9.dll";
+    xlog::info("Loading d3d8to9.dll: {}", d3d8to9_path);
+    HMODULE d3d8to9_module = LoadLibraryA(d3d8to9_path.c_str());
+    if (!d3d8to9_module) {
+        xlog::warn("Failed to load d3d8to9.dll (error {}), falling back to d3d8.dll", GetLastError());
+        return;
+    }
+
+    auto* d3d8to9_create8_export = reinterpret_cast<Direct3DCreate8Fn>(GetProcAddress(d3d8to9_module, "Direct3DCreate8"));
+    if (!d3d8to9_create8_export) {
+        xlog::warn("Could not resolve Direct3DCreate8 in d3d8to9.dll, falling back to d3d8.dll");
+        return;
+    }
+
+    g_d3d8to9_create8_export = d3d8to9_create8_export;
+    xlog::info("Using d3d8to9 Direct3DCreate8 bridge");
+}
 int g_aim_slowdown_log_count = 0;
 int g_crosshair_indicator_log_count = 0;
 std::array<uintptr_t, 16> g_inactive_callsite_rvas{};
@@ -1561,7 +1608,13 @@ void hook_d3d8_instance(IDirect3D8* d3d8)
 
 IDirect3D8* __stdcall d3d8_create8_export_hook(UINT sdk_version)
 {
-    IDirect3D8* d3d8 = g_d3d8_create8_export_hook.call_target(sdk_version);
+    IDirect3D8* d3d8 = nullptr;
+    if (g_d3d8to9_create8_export) {
+        d3d8 = g_d3d8to9_create8_export(sdk_version);
+    }
+    else {
+        d3d8 = g_d3d8_create8_export_hook.call_target(sdk_version);
+    }
     hook_d3d8_instance(d3d8);
     return d3d8;
 }
@@ -1591,6 +1644,7 @@ void install_window_mode_patch()
     }
 
     g_windowed_mode_forced = true;
+    init_d3d8to9_bridge();
 
     HMODULE d3d8_module = GetModuleHandleA("d3d8.dll");
     if (!d3d8_module) {
